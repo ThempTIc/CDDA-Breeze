@@ -34,6 +34,39 @@ std::string json_escape( const std::string &value )
     return result;
 }
 
+std::string base64_encode( const std::vector<char> &data )
+{
+    static const std::string base64_chars =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
+
+    std::string result;
+    result.reserve( ( ( data.size() + 2 ) / 3 ) * 4 );
+
+    for( std::size_t i = 0; i < data.size(); i += 3 ) {
+        const unsigned int byte0 = static_cast<unsigned char>( data[i] );
+        const bool has_byte1 = i + 1 < data.size();
+        const bool has_byte2 = i + 2 < data.size();
+        const unsigned int byte1 = has_byte1 ? static_cast<unsigned char>( data[i + 1] ) : 0;
+        const unsigned int byte2 = has_byte2 ? static_cast<unsigned char>( data[i + 2] ) : 0;
+
+        result += base64_chars[( byte0 >> 2 ) & 0x3f];
+        result += base64_chars[( ( byte0 & 0x03 ) << 4 ) | ( byte1 >> 4 )];
+        result += has_byte1 ? base64_chars[( ( byte1 & 0x0f ) << 2 ) | ( byte2 >> 6 )] : '=';
+        result += has_byte2 ? base64_chars[byte2 & 0x3f] : '=';
+    }
+
+    return result;
+}
+
+bool is_agnes_api_url( const std::string &base_url, const std::string &model )
+{
+    return base_url.find( "agnes-ai.com" ) != std::string::npos ||
+           model.rfind( "agnes-", 0 ) == 0;
+}
+
+
 std::string url_encode( const std::string &value )
 {
     char *encoded = curl_easy_escape( nullptr, value.c_str(), static_cast<int>( value.length() ) );
@@ -455,6 +488,10 @@ RequestId start_pollinations_image_request( const std::string &prompt )
 {
     std::string api_key = get_option<std::string>( "密钥" );
     std::string model = get_option<std::string>( "生图模型名称" );
+    std::string base_url = get_option<std::string>( "API地址" );
+    while( !base_url.empty() && base_url.back() == '/' ) {
+        base_url.pop_back();
+    }
 
     Headers headers;
     headers["Content-Type"] = "application/json";
@@ -463,14 +500,22 @@ RequestId start_pollinations_image_request( const std::string &prompt )
         headers["Authorization"] = "Bearer " + api_key;
     }
 
-    std::string json_body = "{\"prompt\":\"" + json_escape( prompt ) + "\",\"model\":\"" + json_escape( model.empty() ? "flux" : model ) + "\",\"size\":\"381x522\",\"n\":1,\"response_format\":\"b64_json\"}";
-
-    std::string base_url = get_option<std::string>( "API地址" );
-    if( !base_url.empty() && base_url.back() == '/' ) {
-        base_url.pop_back();
+    const std::string actual_model = model.empty() ? "flux" : model;
+    std::string json_body;
+    if( is_agnes_api_url( base_url, model ) ) {
+        // Agnes 的文生图接口使用 return_base64 返回 data[0].b64_json，
+        // 并使用 1K + 3:4 保持 NPC 立绘的竖向比例。
+        json_body = "{\"prompt\":\"" + json_escape( prompt ) +
+                    "\",\"model\":\"" + json_escape( actual_model ) +
+                    "\",\"size\":\"1K\",\"ratio\":\"3:4\",\"return_base64\":true}";
+    } else {
+        // 保留 Pollinations 原有的 OpenAI 兼容请求格式。
+        json_body = "{\"prompt\":\"" + json_escape( prompt ) + "\",\"model\":\"" +
+                    json_escape( actual_model ) +
+                    "\",\"size\":\"381x522\",\"n\":1,\"response_format\":\"b64_json\"}";
     }
-    std::string url = base_url + "/v1/images/generations";
 
+    const std::string url = base_url + "/v1/images/generations";
     return start_post( url, json_body, headers );
 }
 
@@ -478,6 +523,48 @@ RequestId start_pollinations_image_edit_request( const std::string &prompt, cons
 {
     std::string api_key = get_option<std::string>( "密钥" );
     std::string model = get_option<std::string>( "生图模型名称" );
+    std::string base_url = get_option<std::string>( "API地址" );
+    while( !base_url.empty() && base_url.back() == '/' ) {
+        base_url.pop_back();
+    }
+
+    if( is_agnes_api_url( base_url, model ) ) {
+        std::ifstream image_file( image_path, std::ios::binary | std::ios::ate );
+        if( !image_file.is_open() ) {
+            add_msg( m_bad, string_format( "无法打开参考图片：%s", image_path.c_str() ) );
+            return 0;
+        }
+
+        const std::streamsize file_size = image_file.tellg();
+        if( file_size < 0 ) {
+            add_msg( m_bad, string_format( "无法读取参考图片：%s", image_path.c_str() ) );
+            return 0;
+        }
+        image_file.seekg( 0, std::ios::beg );
+        std::vector<char> buffer( static_cast<std::size_t>( file_size ) );
+        if( file_size > 0 && !image_file.read( buffer.data(), file_size ) ) {
+            add_msg( m_bad, string_format( "无法读取参考图片：%s", image_path.c_str() ) );
+            return 0;
+        }
+        image_file.close();
+
+        const std::string actual_model = model.empty() ? "agnes-image-2.1-flash" : model;
+        const std::string image_data = "data:image/png;base64," + base64_encode( buffer );
+        const std::string json_body =
+            "{\"prompt\":\"" + json_escape( prompt ) +
+            "\",\"model\":\"" + json_escape( actual_model ) +
+            "\",\"size\":\"1K\",\"ratio\":\"3:4\",\"extra_body\":{\"image\":[\"" +
+            json_escape( image_data ) + "\"],\"response_format\":\"b64_json\"}}";
+
+        Headers headers;
+        headers["Content-Type"] = "application/json";
+        headers["Accept"] = "application/json";
+        if( !api_key.empty() ) {
+            headers["Authorization"] = "Bearer " + api_key;
+        }
+
+        return start_post( base_url + "/v1/images/generations", json_body, headers );
+    }
 
     // 读取本地图片文件数据
     std::ifstream image_file( image_path, std::ios::binary | std::ios::ate );
@@ -583,11 +670,7 @@ RequestId start_pollinations_image_edit_request( const std::string &prompt, cons
         headers["Authorization"] = "Bearer " + api_key;
     }
 
-    std::string base_url = get_option<std::string>( "API地址" );
-    if( !base_url.empty() && base_url.back() == '/' ) {
-        base_url.pop_back();
-    }
-    std::string url = base_url + "/v1/images/edits";
+    const std::string url = base_url + "/v1/images/edits";
 
     return start_post( url, body, headers );
 }

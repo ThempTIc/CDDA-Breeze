@@ -3171,7 +3171,7 @@ void options_manager::add_options_ai() {
     );
     add("密钥", "ai", to_translation("密钥"),
         to_translation("填入AI服务对应的API密钥。"),
-        "", 50
+        "", 256
     );
     add("文本模型名称", "ai", to_translation("文本模型名称"),
         to_translation("要调用的文本模型名称。会应用于润色NPC的回复内容。"),
