@@ -195,6 +195,10 @@ RequestId start_get( const std::string &url, const Headers &headers )
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
+    curl_easy_setopt( handle, CURLOPT_USERAGENT,
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36" );
     curl_easy_setopt( handle, CURLOPT_WRITEFUNCTION, write_callback );
     curl_easy_setopt( handle, CURLOPT_WRITEDATA, &req->response_body );
     curl_easy_setopt( handle, CURLOPT_FOLLOWLOCATION, 1L );
@@ -236,6 +240,10 @@ RequestId start_post( const std::string &url, const std::string &data, const Hea
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
+    curl_easy_setopt( handle, CURLOPT_USERAGENT,
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36" );
     curl_easy_setopt( handle, CURLOPT_POSTFIELDS, req->post_data.c_str() );
     curl_easy_setopt( handle, CURLOPT_POSTFIELDSIZE, req->post_data.size() );
     curl_easy_setopt( handle, CURLOPT_WRITEFUNCTION, write_callback );
