@@ -112,6 +112,9 @@ curl_slist *build_curl_headers( const network::Headers &headers )
         std::string header = pair.first + ": " + pair.second;
         list = curl_slist_append( list, header.c_str() );
     }
+    // Some CDN/WAF configurations handle libcurl's 100-continue handshake
+    // differently from curl.exe. Suppress it for JSON and multipart posts.
+    list = curl_slist_append( list, "Expect:" );
     return list;
 }
 
@@ -195,6 +198,7 @@ RequestId start_get( const std::string &url, const Headers &headers )
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
+    curl_easy_setopt( handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1 );
     curl_easy_setopt( handle, CURLOPT_USERAGENT,
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -240,6 +244,7 @@ RequestId start_post( const std::string &url, const std::string &data, const Hea
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
+    curl_easy_setopt( handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1 );
     curl_easy_setopt( handle, CURLOPT_USERAGENT,
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
