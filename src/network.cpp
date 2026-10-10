@@ -528,7 +528,7 @@ RequestId start_pollinations_image_request( const std::string &prompt )
         headers["Accept"] = "text/event-stream";
         json_body = "{\"model\":\"" + json_escape( actual_model ) +
                     "\",\"prompt\":\"" + json_escape( prompt ) +
-                    "\",\"aspect_ratio\":\"3:4\",\"resolution\":\"1K\"}";
+                    "\",\"aspect_ratio\":\"3:4\",\"resolution\":\"1K\",\"response_format\":\"b64_json\"}";
         url = base_url + "/v1/images/stream";
     } else if( is_agnes_api_url( base_url, model ) ) {
         // Agnes 的文生图接口使用 return_base64 返回 data[0].b64_json，
@@ -765,14 +765,22 @@ static std::string standard_base64_decode( const std::string &encoded_string )
 bool parse_pollinations_image_response( const std::string &json_response, const std::string &save_path )
 {
     try {
-        auto save_base64_image = [&]( const std::string &b64_data ) {
+        auto save_base64_image = [&]( std::string b64_data ) {
             if( b64_data.empty() ) {
                 return false;
             }
+
+            // Also accept a data URI in case the provider returns it in url.
+            const std::size_t base64_pos = b64_data.find( "base64," );
+            if( base64_pos != std::string::npos ) {
+                b64_data = b64_data.substr( base64_pos + 7 );
+            }
+
             const std::string decoded_data = standard_base64_decode( b64_data );
             if( decoded_data.empty() ) {
                 return false;
             }
+
             std::ofstream out_file( save_path, std::ios::binary );
             if( !out_file.is_open() ) {
                 return false;
@@ -781,45 +789,122 @@ bool parse_pollinations_image_response( const std::string &json_response, const 
             return out_file.good();
         };
 
-        // Vyce AI's /v1/images/stream response is SSE. The final data event
-        // contains the same b64_json field as the regular Images API response.
-        // Extracting that field first lets the existing image pipeline consume
-        // both a plain JSON response and an SSE response.
-        const std::string b64_marker = "\"b64_json\"";
-        const std::size_t marker_pos = json_response.find( b64_marker );
-        if( marker_pos != std::string::npos ) {
-            const std::size_t colon_pos = json_response.find( ':', marker_pos + b64_marker.size() );
-            const std::size_t value_start = colon_pos == std::string::npos ?
-                                             std::string::npos : json_response.find( '"', colon_pos + 1 );
-            const std::size_t value_end = value_start == std::string::npos ?
-                                          std::string::npos : json_response.find( '"', value_start + 1 );
-            if( value_start != std::string::npos && value_end != std::string::npos ) {
-                return save_base64_image( json_response.substr( value_start + 1,
-                                                                  value_end - value_start - 1 ) );
+        auto extract_image_data = [&]( const std::string &payload ) {
+            std::string image_data;
+            try {
+                std::istringstream ss( payload );
+                TextJsonIn jsin( ss );
+                TextJsonObject jo = jsin.get_object();
+                jo.allow_omitted_members();
+
+                auto extract_image_object = [&]( TextJsonObject image_object ) {
+                    image_object.allow_omitted_members();
+                    if( image_object.has_member( "b64_json" ) ) {
+                        const std::string value = image_object.get_string( "b64_json" );
+                        if( !value.empty() ) {
+                            image_data = value;
+                        }
+                    } else if( image_object.has_member( "url" ) ) {
+                        const std::string value = image_object.get_string( "url" );
+                        if( value.find( "base64," ) != std::string::npos ) {
+                            image_data = value;
+                        }
+                    }
+                };
+
+                if( jo.has_member( "data" ) ) {
+                    TextJsonArray data = jo.get_array( "data" );
+                    for( std::size_t i = 0; i < data.size(); ++i ) {
+                        extract_image_object( data.get_object( i ) );
+                    }
+                } else {
+                    extract_image_object( jo );
+                }
+            } catch( ... ) {
+                // The caller also handles non-JSON SSE payloads below.
+            }
+            return image_data;
+        };
+
+        // /v1/images/stream is Server-Sent Events.  Each data event is a
+        // separate JSON object and the final event may follow one or more
+        // partial-image events.  Keep the last non-empty image payload.
+        std::istringstream lines( json_response );
+        std::string line;
+        std::string event_data;
+        std::string image_data;
+        bool saw_sse_line = false;
+
+        auto consume_event = [&]() {
+            if( event_data.empty() || event_data == "[DONE]" ) {
+                event_data.clear();
+                return;
+            }
+            const std::string candidate = extract_image_data( event_data );
+            if( !candidate.empty() ) {
+                image_data = candidate;
+            }
+            event_data.clear();
+        };
+
+        while( std::getline( lines, line ) ) {
+            if( !line.empty() && line.back() == '\r' ) {
+                line.pop_back();
+            }
+            if( line.rfind( "data:", 0 ) == 0 ) {
+                saw_sse_line = true;
+                std::string data_part = line.substr( 5 );
+                if( !data_part.empty() && data_part.front() == ' ' ) {
+                    data_part.erase( 0, 1 );
+                }
+                if( !event_data.empty() ) {
+                    event_data += '\n';
+                }
+                event_data += data_part;
+            } else if( line.empty() ) {
+                consume_event();
+            }
+        }
+        consume_event();
+
+        // Keep compatibility with ordinary JSON image responses and with
+        // providers that put a base64 data URI in the url field.
+        if( !saw_sse_line ) {
+            const std::string candidate = extract_image_data( json_response );
+            if( !candidate.empty() ) {
+                image_data = candidate;
             }
         }
 
-        std::istringstream ss( json_response );
-        TextJsonIn jsin( ss );
-        TextJsonObject jo = jsin.get_object();
-        jo.allow_omitted_members();
-
-        if( !jo.has_member( "data" ) ) {
-            return false;
+        // Last-resort extraction for an SSE payload that is not valid JSON as
+        // a whole.  Choose the last b64_json occurrence because earlier SSE
+        // events can contain partial images.
+        if( image_data.empty() ) {
+            std::size_t search_pos = 0;
+            while( true ) {
+                const std::size_t marker_pos = json_response.find( "\"b64_json\"", search_pos );
+                if( marker_pos == std::string::npos ) {
+                    break;
+                }
+                const std::size_t colon_pos = json_response.find( ':', marker_pos + 10 );
+                const std::size_t value_start = colon_pos == std::string::npos ?
+                                                 std::string::npos : json_response.find( '"', colon_pos + 1 );
+                const std::size_t value_end = value_start == std::string::npos ?
+                                               std::string::npos : json_response.find( '"', value_start + 1 );
+                if( value_start != std::string::npos && value_end != std::string::npos ) {
+                    const std::string candidate = json_response.substr( value_start + 1,
+                                                                         value_end - value_start - 1 );
+                    if( !candidate.empty() ) {
+                        image_data = candidate;
+                    }
+                    search_pos = value_end + 1;
+                } else {
+                    break;
+                }
+            }
         }
 
-        TextJsonArray data = jo.get_array( "data" );
-        if( data.empty() ) {
-            return false;
-        }
-
-        TextJsonObject image_data = data.get_object( 0 );
-        image_data.allow_omitted_members();
-        if( image_data.has_member( "b64_json" ) ) {
-            return save_base64_image( image_data.get_string( "b64_json" ) );
-        }
-
-        return false;
+        return save_base64_image( image_data );
     } catch( const std::exception & ) {
         return false;
     } catch( ... ) {
