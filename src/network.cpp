@@ -66,6 +66,11 @@ bool is_agnes_api_url( const std::string &base_url, const std::string &model )
            model.rfind( "agnes-", 0 ) == 0;
 }
 
+bool is_vyce_api_url( const std::string &base_url )
+{
+    return base_url.find( "vyceai.com" ) != std::string::npos;
+}
+
 
 std::string url_encode( const std::string &value )
 {
@@ -515,20 +520,31 @@ RequestId start_pollinations_image_request( const std::string &prompt )
 
     const std::string actual_model = model.empty() ? "flux" : model;
     std::string json_body;
-    if( is_agnes_api_url( base_url, model ) ) {
+    std::string url;
+    if( is_vyce_api_url( base_url ) ) {
+        // Vyce AI's generations endpoint can return a Cloudflare challenge to
+        // native clients. Its web image client uses the SSE stream endpoint,
+        // which returns the completed image as data[0].b64_json.
+        headers["Accept"] = "text/event-stream";
+        json_body = "{\"model\":\"" + json_escape( actual_model ) +
+                    "\",\"prompt\":\"" + json_escape( prompt ) +
+                    "\",\"aspect_ratio\":\"3:4\",\"resolution\":\"1K\"}";
+        url = base_url + "/v1/images/stream";
+    } else if( is_agnes_api_url( base_url, model ) ) {
         // Agnes 的文生图接口使用 return_base64 返回 data[0].b64_json，
         // 并使用 1K + 3:4 保持 NPC 立绘的竖向比例。
         json_body = "{\"prompt\":\"" + json_escape( prompt ) +
                     "\",\"model\":\"" + json_escape( actual_model ) +
                     "\",\"size\":\"1K\",\"ratio\":\"3:4\",\"return_base64\":true}";
+        url = base_url + "/v1/images/generations";
     } else {
         // 保留 Pollinations 原有的 OpenAI 兼容请求格式。
         json_body = "{\"prompt\":\"" + json_escape( prompt ) + "\",\"model\":\"" +
                     json_escape( actual_model ) +
                     "\",\"size\":\"381x522\",\"n\":1,\"response_format\":\"b64_json\"}";
+        url = base_url + "/v1/images/generations";
     }
 
-    const std::string url = base_url + "/v1/images/generations";
     return start_post( url, json_body, headers );
 }
 
@@ -749,6 +765,39 @@ static std::string standard_base64_decode( const std::string &encoded_string )
 bool parse_pollinations_image_response( const std::string &json_response, const std::string &save_path )
 {
     try {
+        auto save_base64_image = [&]( const std::string &b64_data ) {
+            if( b64_data.empty() ) {
+                return false;
+            }
+            const std::string decoded_data = standard_base64_decode( b64_data );
+            if( decoded_data.empty() ) {
+                return false;
+            }
+            std::ofstream out_file( save_path, std::ios::binary );
+            if( !out_file.is_open() ) {
+                return false;
+            }
+            out_file.write( decoded_data.data(), static_cast<std::streamsize>( decoded_data.size() ) );
+            return out_file.good();
+        };
+
+        // Vyce AI's /v1/images/stream response is SSE. The final data event
+        // contains the same b64_json field as the regular Images API response.
+        // Extracting that field first lets the existing image pipeline consume
+        // both a plain JSON response and an SSE response.
+        const std::string b64_marker = "\"b64_json\"";
+        const std::size_t marker_pos = json_response.find( b64_marker );
+        if( marker_pos != std::string::npos ) {
+            const std::size_t colon_pos = json_response.find( ':', marker_pos + b64_marker.size() );
+            const std::size_t value_start = colon_pos == std::string::npos ?
+                                             std::string::npos : json_response.find( '"', colon_pos + 1 );
+            const std::size_t value_end = value_start == std::string::npos ?
+                                          std::string::npos : json_response.find( '"', value_start + 1 );
+            if( value_start != std::string::npos && value_end != std::string::npos ) {
+                return save_base64_image( json_response.substr( value_start + 1,
+                                                                  value_end - value_start - 1 ) );
+            }
+        }
 
         std::istringstream ss( json_response );
         TextJsonIn jsin( ss );
@@ -767,26 +816,11 @@ bool parse_pollinations_image_response( const std::string &json_response, const 
         TextJsonObject image_data = data.get_object( 0 );
         image_data.allow_omitted_members();
         if( image_data.has_member( "b64_json" ) ) {
-            std::string b64_data = image_data.get_string( "b64_json" );
-            std::string decoded_data = standard_base64_decode( b64_data );
-
-            std::ofstream out_file( save_path, std::ios::binary );
-            if( out_file.is_open() ) {
-                out_file.write( decoded_data.c_str(), decoded_data.size() );
-                out_file.close();
-                
-                // 验证文件是否成功写入
-                std::ifstream check_file( save_path, std::ios::binary | std::ios::ate );
-                if( check_file.is_open() ) {
-                    std::streamsize file_size = check_file.tellg();
-                    check_file.close();
-                }
-                return true;
-            }
+            return save_base64_image( image_data.get_string( "b64_json" ) );
         }
 
         return false;
-    } catch( const std::exception &e ) {
+    } catch( const std::exception & ) {
         return false;
     } catch( ... ) {
         return false;
