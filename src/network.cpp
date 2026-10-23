@@ -34,43 +34,60 @@ std::string json_escape( const std::string &value )
     return result;
 }
 
-std::string base64_encode( const std::vector<char> &data )
+// 按文件头识别图片真实格式。
+// 立绘可能是 PNG 也可能是 JPEG（Magpie 等网关返回的就是 JPEG），
+// 向服务端声明错误的 Content-Type 会被部分实现直接拒绝。
+std::string detect_image_mime_type( const std::vector<char> &data )
 {
-    static const std::string base64_chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789+/";
+    const auto matches = [&]( const std::string &magic ) {
+        if( data.size() < magic.size() ) {
+            return false;
+        }
+        for( std::size_t i = 0; i < magic.size(); i++ ) {
+            if( data[i] != magic[i] ) {
+                return false;
+            }
+        }
+        return true;
+    };
 
-    std::string result;
-    result.reserve( ( ( data.size() + 2 ) / 3 ) * 4 );
-
-    for( std::size_t i = 0; i < data.size(); i += 3 ) {
-        const unsigned int byte0 = static_cast<unsigned char>( data[i] );
-        const bool has_byte1 = i + 1 < data.size();
-        const bool has_byte2 = i + 2 < data.size();
-        const unsigned int byte1 = has_byte1 ? static_cast<unsigned char>( data[i + 1] ) : 0;
-        const unsigned int byte2 = has_byte2 ? static_cast<unsigned char>( data[i + 2] ) : 0;
-
-        result += base64_chars[( byte0 >> 2 ) & 0x3f];
-        result += base64_chars[( ( byte0 & 0x03 ) << 4 ) | ( byte1 >> 4 )];
-        result += has_byte1 ? base64_chars[( ( byte1 & 0x0f ) << 2 ) | ( byte2 >> 6 )] : '=';
-        result += has_byte2 ? base64_chars[byte2 & 0x3f] : '=';
+    if( matches( std::string( "\x89PNG\r\n\x1a\n", 8 ) ) ) {
+        return "image/png";
+    }
+    if( matches( std::string( "\xFF\xD8\xFF", 3 ) ) ) {
+        return "image/jpeg";
+    }
+    if( matches( "GIF8" ) ) {
+        return "image/gif";
+    }
+    if( matches( "BM" ) ) {
+        return "image/bmp";
+    }
+    if( data.size() >= 12 && matches( "RIFF" ) &&
+        data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' ) {
+        return "image/webp";
     }
 
-    return result;
+    // 未知格式：退回 PNG，与改动前的行为保持一致。
+    return "image/png";
 }
 
-bool is_agnes_api_url( const std::string &base_url, const std::string &model )
+std::string image_file_extension( const std::string &mime_type )
 {
-    return base_url.find( "agnes-ai.com" ) != std::string::npos ||
-           model.rfind( "agnes-", 0 ) == 0;
+    if( mime_type == "image/jpeg" ) {
+        return ".jpg";
+    }
+    if( mime_type == "image/gif" ) {
+        return ".gif";
+    }
+    if( mime_type == "image/webp" ) {
+        return ".webp";
+    }
+    if( mime_type == "image/bmp" ) {
+        return ".bmp";
+    }
+    return ".png";
 }
-
-bool is_vyce_api_url( const std::string &base_url )
-{
-    return base_url.find( "vyceai.com" ) != std::string::npos;
-}
-
 
 std::string url_encode( const std::string &value )
 {
@@ -117,9 +134,6 @@ curl_slist *build_curl_headers( const network::Headers &headers )
         std::string header = pair.first + ": " + pair.second;
         list = curl_slist_append( list, header.c_str() );
     }
-    // Some CDN/WAF configurations handle libcurl's 100-continue handshake
-    // differently from curl.exe. Suppress it for JSON and multipart posts.
-    list = curl_slist_append( list, "Expect:" );
     return list;
 }
 
@@ -203,11 +217,6 @@ RequestId start_get( const std::string &url, const Headers &headers )
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
-    curl_easy_setopt( handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1 );
-    curl_easy_setopt( handle, CURLOPT_USERAGENT,
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36" );
     curl_easy_setopt( handle, CURLOPT_WRITEFUNCTION, write_callback );
     curl_easy_setopt( handle, CURLOPT_WRITEDATA, &req->response_body );
     curl_easy_setopt( handle, CURLOPT_FOLLOWLOCATION, 1L );
@@ -249,11 +258,6 @@ RequestId start_post( const std::string &url, const std::string &data, const Hea
     req->start_time = std::chrono::steady_clock::now();
 
     curl_easy_setopt( handle, CURLOPT_URL, url.c_str() );
-    curl_easy_setopt( handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1 );
-    curl_easy_setopt( handle, CURLOPT_USERAGENT,
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36" );
     curl_easy_setopt( handle, CURLOPT_POSTFIELDS, req->post_data.c_str() );
     curl_easy_setopt( handle, CURLOPT_POSTFIELDSIZE, req->post_data.size() );
     curl_easy_setopt( handle, CURLOPT_WRITEFUNCTION, write_callback );
@@ -506,10 +510,6 @@ RequestId start_pollinations_image_request( const std::string &prompt )
 {
     std::string api_key = get_option<std::string>( "密钥" );
     std::string model = get_option<std::string>( "生图模型名称" );
-    std::string base_url = get_option<std::string>( "API地址" );
-    while( !base_url.empty() && base_url.back() == '/' ) {
-        base_url.pop_back();
-    }
 
     Headers headers;
     headers["Content-Type"] = "application/json";
@@ -518,32 +518,13 @@ RequestId start_pollinations_image_request( const std::string &prompt )
         headers["Authorization"] = "Bearer " + api_key;
     }
 
-    const std::string actual_model = model.empty() ? "flux" : model;
-    std::string json_body;
-    std::string url;
-    if( is_vyce_api_url( base_url ) ) {
-        // Vyce AI's generations endpoint can return a Cloudflare challenge to
-        // native clients. Its web image client uses the SSE stream endpoint,
-        // which returns the completed image as data[0].b64_json.
-        headers["Accept"] = "text/event-stream";
-        json_body = "{\"model\":\"" + json_escape( actual_model ) +
-                    "\",\"prompt\":\"" + json_escape( prompt ) +
-                    "\",\"aspect_ratio\":\"3:4\",\"resolution\":\"1K\",\"response_format\":\"b64_json\"}";
-        url = base_url + "/v1/images/stream";
-    } else if( is_agnes_api_url( base_url, model ) ) {
-        // Agnes 的文生图接口使用 return_base64 返回 data[0].b64_json，
-        // 并使用 1K + 3:4 保持 NPC 立绘的竖向比例。
-        json_body = "{\"prompt\":\"" + json_escape( prompt ) +
-                    "\",\"model\":\"" + json_escape( actual_model ) +
-                    "\",\"size\":\"1K\",\"ratio\":\"3:4\",\"return_base64\":true}";
-        url = base_url + "/v1/images/generations";
-    } else {
-        // 保留 Pollinations 原有的 OpenAI 兼容请求格式。
-        json_body = "{\"prompt\":\"" + json_escape( prompt ) + "\",\"model\":\"" +
-                    json_escape( actual_model ) +
-                    "\",\"size\":\"381x522\",\"n\":1,\"response_format\":\"b64_json\"}";
-        url = base_url + "/v1/images/generations";
+    std::string json_body = "{\"prompt\":\"" + json_escape( prompt ) + "\",\"model\":\"" + json_escape( model.empty() ? "flux" : model ) + "\",\"size\":\"381x522\",\"n\":1,\"response_format\":\"b64_json\"}";
+
+    std::string base_url = get_option<std::string>( "API地址" );
+    if( !base_url.empty() && base_url.back() == '/' ) {
+        base_url.pop_back();
     }
+    std::string url = base_url + "/v1/images/generations";
 
     return start_post( url, json_body, headers );
 }
@@ -552,107 +533,31 @@ RequestId start_pollinations_image_edit_request( const std::string &prompt, cons
 {
     std::string api_key = get_option<std::string>( "密钥" );
     std::string model = get_option<std::string>( "生图模型名称" );
-    std::string base_url = get_option<std::string>( "API地址" );
-    while( !base_url.empty() && base_url.back() == '/' ) {
-        base_url.pop_back();
-    }
 
-    if( is_agnes_api_url( base_url, model ) ) {
-        std::ifstream image_file( image_path, std::ios::binary | std::ios::ate );
-        if( !image_file.is_open() ) {
-            add_msg( m_bad, string_format( "无法打开参考图片：%s", image_path.c_str() ) );
-            return 0;
-        }
-
-        const std::streamsize file_size = image_file.tellg();
-        if( file_size < 0 ) {
-            add_msg( m_bad, string_format( "无法读取参考图片：%s", image_path.c_str() ) );
-            return 0;
-        }
-        image_file.seekg( 0, std::ios::beg );
-        std::vector<char> buffer( static_cast<std::size_t>( file_size ) );
-        if( file_size > 0 && !image_file.read( buffer.data(), file_size ) ) {
-            add_msg( m_bad, string_format( "无法读取参考图片：%s", image_path.c_str() ) );
-            return 0;
-        }
-        image_file.close();
-
-        const std::string actual_model = model.empty() ? "agnes-image-2.1-flash" : model;
-        const std::string image_data = "data:image/png;base64," + base64_encode( buffer );
-        const std::string json_body =
-            "{\"prompt\":\"" + json_escape( prompt ) +
-            "\",\"model\":\"" + json_escape( actual_model ) +
-            "\",\"size\":\"1K\",\"ratio\":\"3:4\",\"extra_body\":{\"image\":[\"" +
-            json_escape( image_data ) + "\"],\"response_format\":\"b64_json\"}}";
-
-        Headers headers;
-        headers["Content-Type"] = "application/json";
-        headers["Accept"] = "application/json";
-        if( !api_key.empty() ) {
-            headers["Authorization"] = "Bearer " + api_key;
-        }
-
-        return start_post( base_url + "/v1/images/generations", json_body, headers );
-    }
-
-    // 读取本地图片文件数据
+    // 读取本地图片文件数据（原样保留二进制字节，下面以「文件部分」上传）
     std::ifstream image_file( image_path, std::ios::binary | std::ios::ate );
     if( !image_file.is_open() ) {
-        add_msg(m_bad, string_format("无法打开参考图片：%s", image_path.c_str()));
+        add_msg( m_bad, string_format( "无法打开参考图片：%s", image_path.c_str() ) );
         return 0;
     }
 
-    std::streamsize file_size = image_file.tellg();
+    const std::streamsize file_size = image_file.tellg();
+    if( file_size <= 0 ) {
+        add_msg( m_bad, string_format( "参考图片为空或无法读取：%s", image_path.c_str() ) );
+        return 0;
+    }
     image_file.seekg( 0, std::ios::beg );
 
-    std::vector<char> buffer( file_size );
-    image_file.read( buffer.data(), file_size );
+    std::vector<char> buffer( static_cast<std::size_t>( file_size ) );
+    if( !image_file.read( buffer.data(), file_size ) ) {
+        add_msg( m_bad, string_format( "无法读取参考图片：%s", image_path.c_str() ) );
+        return 0;
+    }
     image_file.close();
 
-    // 将图片数据转换为 base64（用于 data URI 格式）
-    std::string base64_image;
-    base64_image.resize( ( file_size + 2 ) / 3 * 4 );
-
-    static const std::string base64_chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789+/";
-
-    int bi = 0;
-    int out_i = 0;
-    unsigned char char_array_3[3];
-    unsigned char char_array_4[4];
-
-    for( std::streamsize k = 0; k < file_size; ) {
-        int char_array_3_len = 0;
-        while( bi < 3 && k < file_size ) {
-            char_array_3[bi++] = buffer[k++];
-            char_array_3_len++;
-        }
-
-        char_array_4[0] = ( char_array_3[0] & 0xFC ) >> 2;
-        char_array_4[1] = ( ( char_array_3[0] & 0x03 ) << 4 ) + ( ( char_array_3[1] & 0xF0 ) >> 4 );
-        char_array_4[2] = ( ( char_array_3[1] & 0x0F ) << 2 ) + ( ( char_array_3[2] & 0xC0 ) >> 6 );
-        char_array_4[3] = char_array_3[2] & 0x3F;
-
-        for( int m = 0; m < char_array_3_len + 1; m++ ) {
-            if( out_i < static_cast<int>( base64_image.size() ) ) {
-                base64_image[out_i++] = base64_chars[char_array_4[m]];
-            }
-        }
-
-        if( bi < 3 ) {
-            char_array_4[bi] = 64; // '='
-            while( bi < 3 ) {
-                if( out_i < static_cast<int>( base64_image.size() ) ) {
-                    base64_image[out_i++] = '=';
-                }
-                bi++;
-            }
-        }
-
-        bi = 0;
-    }
+    const std::string mime_type = detect_image_mime_type( buffer );
+    const std::string file_name = "reference" + image_file_extension( mime_type );
+    const std::string image_bytes( buffer.data(), buffer.size() );
 
     // 构建 multipart/form-data body
     std::string boundary = "----CDDABreezeFormBoundary" + std::to_string( std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -685,10 +590,15 @@ RequestId start_pollinations_image_edit_request( const std::string &prompt, cons
     body += "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n";
     body += "b64_json\r\n";
 
-    // image 字段 - 使用 data URI 格式
+    // image 字段 —— 必须以「文件部分」(multipart file part) 上传原始字节。
+    // 标准 OpenAI 的 /v1/images/edits、以及 Magpie 之类的本地网关，都按「文件部分」解析图片；
+    // 若把 base64 的 Data URI 当成普通文本字段发过去，会被判为「an edit needs the image to edit」。
     body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"image\"\r\n\r\n";
-    body += "data:image/png;base64," + base64_image + "\r\n";
+    body += "Content-Disposition: form-data; name=\"image\"; filename=\"" + file_name + "\"\r\n";
+    body += "Content-Type: " + mime_type + "\r\n";
+    body += "\r\n";
+    body += image_bytes;
+    body += "\r\n";
 
     body += "--" + boundary + "--\r\n";
 
@@ -699,7 +609,11 @@ RequestId start_pollinations_image_edit_request( const std::string &prompt, cons
         headers["Authorization"] = "Bearer " + api_key;
     }
 
-    const std::string url = base_url + "/v1/images/edits";
+    std::string base_url = get_option<std::string>( "API地址" );
+    if( !base_url.empty() && base_url.back() == '/' ) {
+        base_url.pop_back();
+    }
+    std::string url = base_url + "/v1/images/edits";
 
     return start_post( url, body, headers );
 }
@@ -765,147 +679,44 @@ static std::string standard_base64_decode( const std::string &encoded_string )
 bool parse_pollinations_image_response( const std::string &json_response, const std::string &save_path )
 {
     try {
-        auto save_base64_image = [&]( std::string b64_data ) {
-            if( b64_data.empty() ) {
-                return false;
-            }
 
-            // Also accept a data URI in case the provider returns it in url.
-            const std::size_t base64_pos = b64_data.find( "base64," );
-            if( base64_pos != std::string::npos ) {
-                b64_data = b64_data.substr( base64_pos + 7 );
-            }
+        std::istringstream ss( json_response );
+        TextJsonIn jsin( ss );
+        TextJsonObject jo = jsin.get_object();
+        jo.allow_omitted_members();
 
-            const std::string decoded_data = standard_base64_decode( b64_data );
-            if( decoded_data.empty() ) {
-                return false;
-            }
+        if( !jo.has_member( "data" ) ) {
+            return false;
+        }
+
+        TextJsonArray data = jo.get_array( "data" );
+        if( data.empty() ) {
+            return false;
+        }
+
+        TextJsonObject image_data = data.get_object( 0 );
+        image_data.allow_omitted_members();
+        if( image_data.has_member( "b64_json" ) ) {
+            std::string b64_data = image_data.get_string( "b64_json" );
+            std::string decoded_data = standard_base64_decode( b64_data );
 
             std::ofstream out_file( save_path, std::ios::binary );
-            if( !out_file.is_open() ) {
-                return false;
-            }
-            out_file.write( decoded_data.data(), static_cast<std::streamsize>( decoded_data.size() ) );
-            return out_file.good();
-        };
-
-        auto extract_image_data = [&]( const std::string &payload ) {
-            std::string image_data;
-            try {
-                std::istringstream ss( payload );
-                TextJsonIn jsin( ss );
-                TextJsonObject jo = jsin.get_object();
-                jo.allow_omitted_members();
-
-                auto extract_image_object = [&]( TextJsonObject image_object ) {
-                    image_object.allow_omitted_members();
-                    if( image_object.has_member( "b64_json" ) ) {
-                        const std::string value = image_object.get_string( "b64_json" );
-                        if( !value.empty() ) {
-                            image_data = value;
-                        }
-                    } else if( image_object.has_member( "url" ) ) {
-                        const std::string value = image_object.get_string( "url" );
-                        if( value.find( "base64," ) != std::string::npos ) {
-                            image_data = value;
-                        }
-                    }
-                };
-
-                if( jo.has_member( "data" ) ) {
-                    TextJsonArray data = jo.get_array( "data" );
-                    for( std::size_t i = 0; i < data.size(); ++i ) {
-                        extract_image_object( data.get_object( i ) );
-                    }
-                } else {
-                    extract_image_object( jo );
+            if( out_file.is_open() ) {
+                out_file.write( decoded_data.c_str(), decoded_data.size() );
+                out_file.close();
+                
+                // 验证文件是否成功写入
+                std::ifstream check_file( save_path, std::ios::binary | std::ios::ate );
+                if( check_file.is_open() ) {
+                    std::streamsize file_size = check_file.tellg();
+                    check_file.close();
                 }
-            } catch( ... ) {
-                // The caller also handles non-JSON SSE payloads below.
-            }
-            return image_data;
-        };
-
-        // /v1/images/stream is Server-Sent Events.  Each data event is a
-        // separate JSON object and the final event may follow one or more
-        // partial-image events.  Keep the last non-empty image payload.
-        std::istringstream lines( json_response );
-        std::string line;
-        std::string event_data;
-        std::string image_data;
-        bool saw_sse_line = false;
-
-        auto consume_event = [&]() {
-            if( event_data.empty() || event_data == "[DONE]" ) {
-                event_data.clear();
-                return;
-            }
-            const std::string candidate = extract_image_data( event_data );
-            if( !candidate.empty() ) {
-                image_data = candidate;
-            }
-            event_data.clear();
-        };
-
-        while( std::getline( lines, line ) ) {
-            if( !line.empty() && line.back() == '\r' ) {
-                line.pop_back();
-            }
-            if( line.rfind( "data:", 0 ) == 0 ) {
-                saw_sse_line = true;
-                std::string data_part = line.substr( 5 );
-                if( !data_part.empty() && data_part.front() == ' ' ) {
-                    data_part.erase( 0, 1 );
-                }
-                if( !event_data.empty() ) {
-                    event_data += '\n';
-                }
-                event_data += data_part;
-            } else if( line.empty() ) {
-                consume_event();
-            }
-        }
-        consume_event();
-
-        // Keep compatibility with ordinary JSON image responses and with
-        // providers that put a base64 data URI in the url field.
-        if( !saw_sse_line ) {
-            const std::string candidate = extract_image_data( json_response );
-            if( !candidate.empty() ) {
-                image_data = candidate;
+                return true;
             }
         }
 
-        // Last-resort extraction for an SSE payload that is not valid JSON as
-        // a whole.  Choose the last b64_json occurrence because earlier SSE
-        // events can contain partial images.
-        if( image_data.empty() ) {
-            std::size_t search_pos = 0;
-            while( true ) {
-                const std::size_t marker_pos = json_response.find( "\"b64_json\"", search_pos );
-                if( marker_pos == std::string::npos ) {
-                    break;
-                }
-                const std::size_t colon_pos = json_response.find( ':', marker_pos + 10 );
-                const std::size_t value_start = colon_pos == std::string::npos ?
-                                                 std::string::npos : json_response.find( '"', colon_pos + 1 );
-                const std::size_t value_end = value_start == std::string::npos ?
-                                               std::string::npos : json_response.find( '"', value_start + 1 );
-                if( value_start != std::string::npos && value_end != std::string::npos ) {
-                    const std::string candidate = json_response.substr( value_start + 1,
-                                                                         value_end - value_start - 1 );
-                    if( !candidate.empty() ) {
-                        image_data = candidate;
-                    }
-                    search_pos = value_end + 1;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        return save_base64_image( image_data );
-    } catch( const std::exception & ) {
+        return false;
+    } catch( const std::exception &e ) {
         return false;
     } catch( ... ) {
         return false;
