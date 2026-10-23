@@ -311,7 +311,7 @@ void process()
             }
         }
     }
-    
+
     // 检查超时请求
     auto now = std::chrono::steady_clock::now();
     for( auto &pair : g_requests ) {
@@ -405,25 +405,25 @@ RequestId start_pollinations_request( const std::string &system_prompt,const std
     std::string api_key = get_option<std::string>( "密钥" );
     std::string model = get_option<std::string>( "文本模型名称" );
     std::string temperature = std::to_string(get_option<float>("温度"));
-    
+
     Headers headers;
     headers["Content-Type"] = "application/json";
     headers["Accept"] = "application/json";
     if( !api_key.empty() ) {
         headers["Authorization"] = "Bearer " + api_key;
     }
-    
-    std::string json_body = "{\"messages\":[{\"content\":\"" + json_escape( system_prompt ) + 
+
+    std::string json_body = "{\"messages\":[{\"content\":\"" + json_escape( system_prompt ) +
         "\",\"role\":\"system\"},{\"role\":\"user\",\"content\":\""+json_escape(user_prompt)+"\"}], \"model\":\"" +
-        json_escape(model.empty() ? "openai" : model ) + 
+        json_escape(model.empty() ? "openai" : model ) +
         "\",\"stream\":false,\"temperature\":"+temperature+"}";
-    
+
     std::string base_url = get_option<std::string>( "API地址" );
     if( !base_url.empty() && base_url.back() == '/' ) {
         base_url.pop_back();
     }
     std::string url = base_url + "/v1/chat/completions";
-    
+
     // std::ofstream log_file( "pollinations_request_debug.txt", std::ios::out | std::ios::trunc );
     // if( log_file.is_open() ) {
     //     log_file << "URL:\n";
@@ -442,7 +442,7 @@ RequestId start_pollinations_request( const std::string &system_prompt,const std
     //     log_file << temperature << "\n";
     //     log_file.close();
     // }
-    
+
     return start_post( url, json_body, headers );
 }
 
@@ -704,7 +704,7 @@ bool parse_pollinations_image_response( const std::string &json_response, const 
             if( out_file.is_open() ) {
                 out_file.write( decoded_data.c_str(), decoded_data.size() );
                 out_file.close();
-                
+
                 // 验证文件是否成功写入
                 std::ifstream check_file( save_path, std::ios::binary | std::ios::ate );
                 if( check_file.is_open() ) {
