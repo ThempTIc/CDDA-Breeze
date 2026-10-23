@@ -21,6 +21,7 @@
 #include "color.h"
 #include "creature_tracker.h"
 #include "cursesdef.h"
+#include "d20_roll.h"
 #include "damage.h"
 #include "debug.h"
 #include "effect.h"
@@ -779,6 +780,69 @@ void Creature::deal_melee_hit( Creature *source, int hit_spread, bool critical_h
     dealt_dam.bp_hit = bp_hit;
 }
 
+d20_roll_state get_d20_roll_state( const Character &you, const Creature &target,
+                                   const bool unseen_bonus )
+{
+    const bool target_disadvantaged =
+        target.has_effect( effect_downed ) ||
+        target.has_effect( effect_stunned ) ||
+        target.has_effect( effect_blind ) ||
+        target.has_effect( effect_no_sight );
+    const bool player_disadvantaged =
+        you.has_effect( effect_downed ) ||
+        you.has_effect( effect_stunned ) ||
+        you.has_effect( effect_blind ) ||
+        you.has_effect( effect_no_sight ) ||
+        you.get_perceived_pain() >= 40;
+
+    // 优势与劣势都只按“有/无”计：多个优势只算一个，任意一个劣势即可抵消全部优势
+    const bool advantage_source = target_disadvantaged || unseen_bonus;
+    const bool disadvantage_source = player_disadvantaged;
+
+    if( advantage_source == disadvantage_source ) {
+        return d20_roll_state::normal;
+    }
+    return advantage_source ? d20_roll_state::advantage :
+           d20_roll_state::disadvantage;
+}
+
+std::vector<std::string> get_roll_advantage_reasons( const Character &/*you*/, const Creature &target,
+        const bool unseen_bonus )
+{
+    std::vector<std::string> reasons;
+    if( unseen_bonus ) {
+        reasons.emplace_back( _( "偷袭" ) );
+    }
+    if( target.has_effect( effect_downed ) ) {
+        reasons.emplace_back( _( "目标倒地" ) );
+    }
+    if( target.has_effect( effect_stunned ) ) {
+        reasons.emplace_back( _( "目标眩晕" ) );
+    }
+    if( target.has_effect( effect_blind ) || target.has_effect( effect_no_sight ) ) {
+        reasons.emplace_back( _( "目标失明" ) );
+    }
+    return reasons;
+}
+
+std::vector<std::string> get_roll_disadvantage_reasons( const Character &you )
+{
+    std::vector<std::string> reasons;
+    if( you.has_effect( effect_downed ) ) {
+        reasons.emplace_back( _( "倒地" ) );
+    }
+    if( you.has_effect( effect_stunned ) ) {
+        reasons.emplace_back( _( "眩晕" ) );
+    }
+    if( you.has_effect( effect_blind ) || you.has_effect( effect_no_sight ) ) {
+        reasons.emplace_back( _( "失明" ) );
+    }
+    if( you.get_perceived_pain() >= 40 ) {
+        reasons.emplace_back( _( "疼痛" ) );
+    }
+    return reasons;
+}
+
 double Creature::accuracy_projectile_attack( dealt_projectile_attack &attack ) const
 {
 
@@ -1134,6 +1198,14 @@ void Creature::deal_projectile_attack( Creature *source, dealt_projectile_attack
     }
 
     impact.mult_damage( hit_selection.damage_mult );
+
+    // If we have a shield, it might passively block ranged impacts.
+    // 怪物不会走这条路（Creature 基类默认返回 false），未佩戴盾牌时同样直接返回 false。
+    // damage_mult 为 0 表示这一发只是擦过（下面会打出「没打中」的提示），
+    // 这种命中不该让盾牌磨损、也不该报告成打在盾牌上，因此跳过格挡。
+    if( hit_selection.damage_mult > 0.0 ) {
+        block_ranged_hit( source, hit_selection.bp_hit, impact );
+    }
 
     if( proj_effects.count( "NOGIB" ) > 0 ) {
         float dmg_ratio = static_cast<float>( impact.total_damage() ) / get_hp_max( hit_selection.bp_hit );
